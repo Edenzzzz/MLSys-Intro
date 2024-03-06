@@ -2,29 +2,38 @@
 import copy
 import torch 
 from transformers import (
-    LlamaForCausalLM,
-    AutoTokenizer,
     TrainingArguments,
-    AutoTokenizer,
+    LlamaTokenizer,
     PreTrainedTokenizer,
     get_cosine_schedule_with_warmup,
+    LlamaConfig
 )
+from src.modeling_llama import LlamaForCausalLM
 import transformers
-from transformers import GenerationConfig
 from torch.utils.data import DataLoader   
-import json
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from typing import Dict, Optional, Sequence
 from dataclasses import dataclass, field
 import os
 import torch.nn.functional as F
-from data_utils import *
+from src.data_utils import *
 import tqdm
 
+def init_dist():
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    dist.init_process_group(world_size=world_size, rank=rank,
+                        init_method="env://", backend="nccl")
+    torch.cuda.set_device(local_rank)
 
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="/home/zhongyuting/model/Llama-2-7b-hf", metadata={"help": "Local path to the model or path in huggingface directory"})
-    tp_num_devices: int = field(default=1, metadata={"help": "Tensor parallel device count"})
+    tp: bool = field(default=False, metadata={"help": "Whether to use tensor parallelism."})
+    ddp: bool = field(default=False, metadata={"help": "Whether to use Data Parallel."})
     
 @dataclass
 class DataArguments:
@@ -50,7 +59,7 @@ class TrainingArguments(TrainingArguments):
     
     # Memory optimizations
     gradient_checkpointing: bool = True
-    grad_accumulation_steps: int = 8
+    grad_accumulation_steps: int = 4
     bf16: bool = False
     fp16: bool = False    
     
@@ -86,34 +95,40 @@ def generate(model, prompt, tokenizer, max_new_tokens=100):
 def main():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
+    
+    # Load model and set up parallelism     
+    config = LlamaConfig.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir)
+    config.tp = model_args.tp
     model = LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
-        pretraining_tp=model_args.tp_num_devices,
+        config=config,
     ).to("cuda")
     
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-        
+    
     # Save memory by freezing params
-    n_freeze = 20
-    for param in model.parameters(): param.requires_grad = False
-    for param in model.lm_head.parameters(): param.requires_grad = True
-    for param in model.model.layers[n_freeze: ].parameters(): param.requires_grad = True
+    # Dumb pytorch won't allow partially freezing in DDP
+    if not model_args.ddp: 
+        n_freeze = 15
+        for param in model.parameters(): param.requires_grad = False
+        for param in model.lm_head.parameters(): param.requires_grad = True
+        for param in model.model.layers[n_freeze: ].parameters(): param.requires_grad = True
+        print("Config: ", model.config)
     
-    print("Config: ", model.config)
     
-    # Load vocab and tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
+     # Load vocab and tokenizer
+    tokenizer = LlamaTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
+        # pad_token = PAD_TOKEN,
         use_fast=False,
     )
-    # Llama has no padding token by default, so add it
     
+    # Llama has no padding token by default, so add it
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = PAD_TOKEN
@@ -124,6 +139,11 @@ def main():
         model=model,
     )
     
+    if model_args.ddp:
+        device = "cuda:" + os.environ['LOCAL_RANK']
+        model = DDP(model, device_ids=[device], output_device=device)
+        
+
     # Set up data, optimizer, scheduler
     train_dataset, data_collator = get_data(tokenizer=tokenizer, data_args=data_args)
     train_loader = DataLoader(train_dataset, batch_size=training_args.per_device_training_batch_size, collate_fn=data_collator)
@@ -167,4 +187,5 @@ def main():
 
 
 if __name__ == "__main__":
+    init_dist()
     main()    

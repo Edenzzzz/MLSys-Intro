@@ -134,7 +134,7 @@ class Broadcast(CommOp):
     def __call__(self, tensor: torch.Tensor) -> None:
         super().__call__(None)
         dist.broadcast(tensor, 0, async_op=self.async_op)
-    
+        
     def bw_factor(self):
         return 1 # NCCL implements Ring broadcast. 
     
