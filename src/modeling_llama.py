@@ -79,6 +79,7 @@ def _split(input_: torch.Tensor):
     
         
 def _gather(input_: torch.Tensor):
+    """Gather the input tensor from all GPUs."""
     world_size = dist.get_world_size()
     if world_size == 1:
         return input_
