@@ -4,4 +4,4 @@
 ![alltoall](results/alltoall.jpg)
 
 # LLaMA 2 fine-tuning on Alpaca
-![alt text](image.png)
+![alt text](results/image.png)

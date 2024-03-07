@@ -59,108 +59,142 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
-def _reduce(input_: torch.Tensor):
-    """Reduce the input tensor across all GPUs."""
-    if dist.get_world_size() == 1:
+def _reduce(input_: torch.Tensor, group: dist.ProcessGroupNCCL):
+    """Reduce the input tensor across the comm group."""
+    tp_size = dist.get_world_size(group)
+    if tp_size == 1:
         return input_
-    dist.all_reduce(input_)
+    
+    dist.all_reduce(input_, group=group)
     return input_
 
 
-def _split(input_: torch.Tensor):
+def _split(input_: torch.Tensor, group: dist.ProcessGroupNCCL):
     """Split the input tensor across all GPUs."""
-    world_size = dist.get_world_size()
-    if  world_size == 1:
+    tp_size: int = dist.get_world_size(group)
+    if tp_size == 1:
         return input_
     
-    rank = dist.get_rank()
-    # torch.split doesn't create contiguous tensor by default
-    return input_.split(world_size, dim=-1)[rank].contiguous() 
+    rank = dist.get_rank(group) 
+    return input_.split(tp_size, dim=-1)[rank].clone() # free memory by cloning from the contiguous chunk
     
         
-def _gather(input_: torch.Tensor):
+def _gather(input_: torch.Tensor, group: dist.ProcessGroupNCCL):
     """Gather the input tensor from all GPUs."""
-    world_size = dist.get_world_size()
+    world_size = dist.get_world_size(group)
     if world_size == 1:
         return input_
     
     # gather along columns
-    rank = dist.get_rank()
+    rank = dist.get_rank(group)
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
-    dist.all_gather(tensor_list, input_)
+    dist.all_gather(tensor_list, input_, group)
     
     output = torch.cat(tensor_list, dim=-1).contiguous()
     return output
                       
-                        
+_grad_place_holder = None                       
 class _ToModelParallel(torch.autograd.Function):
     """For ColumnParallel. Pass the input to the model parallel region."""
 
     @staticmethod
-    def forward(ctx, input_: torch.Tensor):
+    def forward(ctx, input_: torch.Tensor, group: dist.ProcessGroupNCCL = None):
+        ctx.group = group
         return input_
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        return _reduce(grad_output)
+        return _reduce(grad_output, ctx.group), _grad_place_holder
 
 
-class _GatherFromModelParallel(torch.autograd.Function):
-    """For ColumnParallel. Gather the input from model parallel region and concatinate."""
-
-    @staticmethod
-    def forward(ctx, input_: torch.Tensor):
-        return _gather(input_)
-        
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        return _split(grad_output)
-        
-
-class ColumnParallelLinear(nn.Module):
-    def __init__(self, input_size: int, output_size: int, weights: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None):
-        super().__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-        
-        self.weights = nn.Parameter(torch.empty(input_size, output_size)) if weights == None else nn.Parameter(weights)
-        self.bias = nn.Parameter(torch.empty(output_size)) if bias == None else nn.Parameter(bias)
-        
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.weight)
-        nn.init.zeros_(self.bias)
-        
-    def forward(self, input_: torch.Tensor):
-        input_ = _ToModelParallel.apply(input_)
-        output = F.linear(input_, self.weights, self.bias) # out = xW^T + b
-        # print("Column Parallel output shape:",  output.shape)
-        return output   
- 
 class _ReduceFromModelParallel(torch.autograd.Function):
     """For RowParallel. All-reduce the input from the model parallel region."""
     
     @staticmethod
-    def forward(ctx, input_):
-        return _reduce(input_)
+    def forward(ctx, input_: torch.Tensor, group: dist.ProcessGroupNCCL = None):
+        return _reduce(input_, group)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output
+        return grad_output, _grad_place_holder
+    
+class _GatherFromModelParallel(torch.autograd.Function):
+    """For ColumnParallel. Gather the input from model parallel region and concatinate."""
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, group: dist.ProcessGroupNCCL = None):
+        ctx.group = group
+        return _gather(input_, group)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return _split(grad_output, ctx.group), _grad_place_holder
     
     
-class RowParallelLinear(nn.Module):
-    def __init__(self, input_size: int, output_size: int, weights: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None):
-        super().__init__()
-        self.input_size = input_size
-        self.output_size = output_size
+class ColumnParallelLinear(nn.Linear):
+    def __init__(self, 
+                 weight: torch.Tensor,
+                 bias: torch.Tensor = None,
+                 group: dist.ProcessGroupNCCL = None,
+                 gather_output: bool = False
+                 ):
+        tp_size = dist.get_world_size(group) 
+        out_shape = weight.shape[0]
+        out_shape_split = out_shape // tp_size
+        super().__init__(in_features=weight.shape[1], out_features=out_shape_split) # lm_head is required to be nn.Linear object
         
-        self.weights = nn.Parameter(torch.empty(input_size, output_size)) if weights == None else nn.Parameter(weights)
-        self.bias = nn.Parameter(torch.empty(output_size)) if bias == None else nn.Parameter(bias)
-    
+        self.gather_output = gather_output
+        self.rank = dist.get_rank(group)
+        assert out_shape % tp_size == 0, f"The out size must be divisible by the parallel size in TP, but we have {out_shape} / {tp_size}"
+        
+        self.group = group
+        self.weight = weight
+        self.bias = bias
+        
+        # Split weights for TP
+        self.weight = nn.Parameter(self.weight.split(out_shape_split, dim=0)[self.rank].clone())
+        if self.bias is not None:
+            self.bias = nn.Parameter(self.bias.split(out_shape_split, dim=0)[self.rank].clone())
+        
+        
     def forward(self, input_: torch.Tensor):
-        output = F.linear(input_, self.weights, self.bias) # out = xW^T + b
-        output = _ReduceFromModelParallel.apply(output)
+        input_ = _ToModelParallel.apply(input_, self.group)
+        output = F.linear(input_, self.weight, self.bias) # out = xW^T + b
+        if self.gather_output:
+            output = _GatherFromModelParallel.apply(output, self.group)
+        return output   
+ 
+
+class RowParallelLinear(nn.Linear):
+    def __init__(self,
+                weight: torch.Tensor,
+                bias: torch.Tensor = None,
+                group: dist.ProcessGroupNCCL = None
+        ):
+        tp_size = dist.get_world_size(group) 
+        in_shape = weight.shape[1] 
+        super().__init__(in_features=in_shape, out_features=weight.shape[0])
+        
+        self.rank = dist.get_rank(group)
+        assert in_shape % tp_size == 0, f"The in size must be divisible by the parallel size in TP, but we have {in_shape} / {tp_size}"
+        
+        self.group = group
+        self.weight = weight
+        self.bias = nn.Parameter(bias) if (self.rank == 0 and bias is not None) else None # Only one rank needs to hold bias as the output dim is not split
+        
+        # Split weights
+        in_shape_split = in_shape // tp_size
+        self.weight = nn.Parameter(self.weight.split(in_shape_split, dim=1)[self.rank].clone())
+        # print(f"rank {rank} Row Parallel weight shape: {self.weight.shape}")
+        
+    def forward(self, input_: torch.Tensor):
+        try:
+            output = F.linear(input_, self.weight, self.bias) # out = xW^T + b
+        except:
+            print(f"rank {self.rank} input: {input_.shape}, weight: {self.weight.shape}, bias: {self.bias.shape}")
+            exit(1)
+        output = _ReduceFromModelParallel.apply(output, self.group)
         return output
              
              
@@ -313,7 +347,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-
+_mlp_printed = False
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -324,32 +358,31 @@ class LlamaMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.tp_on = False
+    
+    def set_tp(self, comm_group: dist.ProcessGroupNCCL):
+        """Enable tensor parallel by spliting weights"""
+        world_size = dist.get_world_size(comm_group)
+        rank = dist.get_rank(comm_group)
+        tp_size = self.config.tp_size
+        assert world_size == tp_size, f"You have a bug in your TP group size! world_size ({world_size}) != tp_size ({tp_size})"
+        self.tp_on = True
+        self.comm_group = comm_group
         
-        if self.config.tp:
-            world_size = dist.get_world_size()
-            rank = dist.get_rank()
-            column_parallel_list = {"gate_proj": self.gate_proj, "up_proj": self.up_proj}
-            
-            for name, module in column_parallel_list.items():
-                weights = module.weight.data 
-                in_shape = weights.shape[1] 
-                out_shape = weights.shape[0]
-                assert out_shape % world_size == 0, f"The hidden size must be divisible by the world size({world_size}) in TP, but we have {module}"
-                
-                out_shape_split = out_shape // world_size
-                weights = weights.split(out_shape_split, dim=0)[rank]
-                module = ColumnParallelLinear(in_shape, out_shape_split, weights=weights)
-                setattr(self, name, module)
-            
-            # Row parallel the second FC
-            weights = self.down_proj.weight.data
-            in_shape_split = weights.shape[1] // world_size
-            out_shape = weights.shape[0]
-            
-            # Split and send 
-            weights = weights.split(in_shape_split, dim=-1)[rank]
-            # print("Row Parallel shape:",  weights.shape)
-            self.down_proj = RowParallelLinear(in_shape_split, out_shape, weights=weights)
+        column_parallel_list = {"gate_proj": self.gate_proj, "up_proj": self.up_proj}    
+        for name, module in column_parallel_list.items():
+            module = ColumnParallelLinear(module.weight, module.bias, comm_group)
+            setattr(self, name, module)
+        
+        # Row parallel the second FC
+        original_shape = self.down_proj.weight.shape
+        self.down_proj = RowParallelLinear(self.down_proj.weight, self.down_proj.bias, comm_group)
+        
+        if self.config.debug_mode:
+            global _mlp_printed
+            if not _mlp_printed:
+                _mlp_printed = True
+                print(f"rank {rank} Row Parallel shape:{self.down_proj.weight.shape}. Original shape: {original_shape} ")
         
     def forward(self, x):
         # if self.config.pretraining_tp > 1:
@@ -453,14 +486,14 @@ class LlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
@@ -562,7 +595,7 @@ class LlamaFlashAttention2(LlamaAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor]]]:
         output_attentions = False
 
         bsz, q_len, _ = hidden_states.size()
@@ -743,13 +776,13 @@ class LlamaSdpaAttention(LlamaAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
@@ -837,7 +870,7 @@ class LlamaDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
@@ -1066,7 +1099,11 @@ class LlamaModel(LlamaPreTrainedModel):
         self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
         # Initialize weights and apply final processing
         self.post_init()
-
+    
+    # def set_tp(self, comm_group: dist.ProcessGroup, tp: int):
+    #     """ Parallelize the embedding layer"""
+    #     pass
+        
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -1077,7 +1114,7 @@ class LlamaModel(LlamaPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -1235,10 +1272,17 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.tp_on = False
         # Initialize weights and apply final processing
         self.post_init()
 
+    def set_tp(self, comm_group: dist.ProcessGroup):
+        """Parallelize the lm head as the vocab size is big"""
+        self.comm_group = comm_group
+        self.tp_on = True
+        self.lm_head = ColumnParallelLinear(self.lm_head.weight, self.lm_head.bias, comm_group)
+
+        
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -1262,7 +1306,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -1475,7 +1519,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,

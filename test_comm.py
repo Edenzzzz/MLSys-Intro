@@ -44,7 +44,6 @@ def parse_size(s: str) -> int:
 
 ### Communicatoin ops ###
 
-
 class CommOp:
     def __init__(self, world_size: int, async_op: bool = False):
         self.world_size = world_size

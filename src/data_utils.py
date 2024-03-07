@@ -10,7 +10,7 @@ import logging
 import os
 import torch
 from torch.utils.data import Dataset
-
+import torch.distributed as dist
 
 IGNORE_INDEX = -100
 PAD_TOKEN = "[PAD]"

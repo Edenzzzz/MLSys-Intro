@@ -1,2 +1,4 @@
 alpaca_tokenized.pt
 checkpoints/**
+__pycache__/**
+**/__pycache__/**
