@@ -23,35 +23,30 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-import torch.distributed as dist
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-)
+from transformers.modeling_outputs import (BaseModelOutputWithPast,
+                                           CausalLMOutputWithPast,
+                                           QuestionAnsweringModelOutput,
+                                           SequenceClassifierOutputWithPast)
 from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
-    logging,
-    replace_return_docstrings,
-)
 from transformers.models.llama.configuration_llama import LlamaConfig
-
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+from transformers.utils import (add_start_docstrings,
+                                add_start_docstrings_to_model_forward,
+                                is_flash_attn_2_available,
+                                is_flash_attn_greater_or_equal_2_10, logging,
+                                replace_return_docstrings)
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+    from flash_attn.bert_padding import (index_first_axis, pad_input,  # noqa
+                                         unpad_input)
 
 
 logger = logging.get_logger(__name__)
@@ -64,7 +59,7 @@ def _reduce(input_: torch.Tensor, group: dist.ProcessGroupNCCL):
     tp_size = dist.get_world_size(group)
     if tp_size == 1:
         return input_
-    
+
     dist.all_reduce(input_, group=group)
     return input_
 
@@ -74,27 +69,30 @@ def _split(input_: torch.Tensor, group: dist.ProcessGroupNCCL):
     tp_size: int = dist.get_world_size(group)
     if tp_size == 1:
         return input_
-    
-    rank = dist.get_rank(group) 
-    return input_.split(tp_size, dim=-1)[rank].clone() # free memory by cloning from the contiguous chunk
-    
-        
+
+    rank = dist.get_rank(group)
+    return input_.split(tp_size, dim=-1)[rank].clone()  # free memory by cloning from the contiguous chunk
+
+
 def _gather(input_: torch.Tensor, group: dist.ProcessGroupNCCL):
     """Gather the input tensor from all GPUs."""
     world_size = dist.get_world_size(group)
     if world_size == 1:
         return input_
-    
+
     # gather along columns
     rank = dist.get_rank(group)
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
     dist.all_gather(tensor_list, input_, group)
-    
+
     output = torch.cat(tensor_list, dim=-1).contiguous()
     return output
-                      
-_grad_place_holder = None                       
+
+
+_grad_place_holder = None
+
+
 class _ToModelParallel(torch.autograd.Function):
     """For ColumnParallel. Pass the input to the model parallel region."""
 
@@ -110,7 +108,7 @@ class _ToModelParallel(torch.autograd.Function):
 
 class _ReduceFromModelParallel(torch.autograd.Function):
     """For RowParallel. All-reduce the input from the model parallel region."""
-    
+
     @staticmethod
     def forward(ctx, input_: torch.Tensor, group: dist.ProcessGroupNCCL = None):
         return _reduce(input_, group)
@@ -118,7 +116,8 @@ class _ReduceFromModelParallel(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output, _grad_place_holder
-    
+
+
 class _GatherFromModelParallel(torch.autograd.Function):
     """For ColumnParallel. Gather the input from model parallel region and concatinate."""
 
@@ -130,74 +129,83 @@ class _GatherFromModelParallel(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         return _split(grad_output, ctx.group), _grad_place_holder
-    
-    
+
+
 class ColumnParallelLinear(nn.Linear):
-    def __init__(self, 
-                 weight: torch.Tensor,
-                 bias: torch.Tensor = None,
-                 group: dist.ProcessGroupNCCL = None,
-                 gather_output: bool = False
-                 ):
-        tp_size = dist.get_world_size(group) 
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor = None,
+        group: dist.ProcessGroupNCCL = None,
+        gather_output: bool = False,
+    ):
+        tp_size = dist.get_world_size(group)
         out_shape = weight.shape[0]
         out_shape_split = out_shape // tp_size
-        super().__init__(in_features=weight.shape[1], out_features=out_shape_split) # lm_head is required to be nn.Linear object
-        
+        super().__init__(
+            in_features=weight.shape[1], out_features=out_shape_split
+        )  # lm_head is required to be nn.Linear object
+
         self.gather_output = gather_output
         self.rank = dist.get_rank(group)
-        assert out_shape % tp_size == 0, f"The out size must be divisible by the parallel size in TP, but we have {out_shape} / {tp_size}"
-        
+        assert (
+            out_shape % tp_size == 0
+        ), f"The out size must be divisible by the parallel size in TP, but we have {out_shape} / {tp_size}"
+
         self.group = group
         self.weight = weight
         self.bias = bias
-        
+
         # Split weights for TP
         self.weight = nn.Parameter(self.weight.split(out_shape_split, dim=0)[self.rank].clone())
         if self.bias is not None:
             self.bias = nn.Parameter(self.bias.split(out_shape_split, dim=0)[self.rank].clone())
-        
-        
+
     def forward(self, input_: torch.Tensor):
         input_ = _ToModelParallel.apply(input_, self.group)
-        output = F.linear(input_, self.weight, self.bias) # out = xW^T + b
+        output = F.linear(input_, self.weight, self.bias)  # out = xW^T + b
         if self.gather_output:
             output = _GatherFromModelParallel.apply(output, self.group)
-        return output   
- 
+        return output
+
 
 class RowParallelLinear(nn.Linear):
-    def __init__(self,
-                weight: torch.Tensor,
-                bias: torch.Tensor = None,
-                group: dist.ProcessGroupNCCL = None
-        ):
-        tp_size = dist.get_world_size(group) 
-        in_shape = weight.shape[1] 
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: torch.Tensor = None,
+        group: dist.ProcessGroupNCCL = None,
+    ):
+        tp_size = dist.get_world_size(group)
+        in_shape = weight.shape[1]
         super().__init__(in_features=in_shape, out_features=weight.shape[0])
-        
+
         self.rank = dist.get_rank(group)
-        assert in_shape % tp_size == 0, f"The in size must be divisible by the parallel size in TP, but we have {in_shape} / {tp_size}"
-        
+        assert (
+            in_shape % tp_size == 0
+        ), f"The in size must be divisible by the parallel size in TP, but we have {in_shape} / {tp_size}"
+
         self.group = group
         self.weight = weight
-        self.bias = nn.Parameter(bias) if (self.rank == 0 and bias is not None) else None # Only one rank needs to hold bias as the output dim is not split
-        
+        self.bias = (
+            nn.Parameter(bias) if (self.rank == 0 and bias is not None) else None
+        )  # Only one rank needs to hold bias as the output dim is not split
+
         # Split weights
         in_shape_split = in_shape // tp_size
         self.weight = nn.Parameter(self.weight.split(in_shape_split, dim=1)[self.rank].clone())
         # print(f"rank {rank} Row Parallel weight shape: {self.weight.shape}")
-        
+
     def forward(self, input_: torch.Tensor):
         try:
-            output = F.linear(input_, self.weight, self.bias) # out = xW^T + b
+            output = F.linear(input_, self.weight, self.bias)  # out = xW^T + b
         except:
             print(f"rank {self.rank} input: {input_.shape}, weight: {self.weight.shape}, bias: {self.bias.shape}")
             exit(1)
         output = _ReduceFromModelParallel.apply(output, self.group)
         return output
-             
-             
+
+
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -231,7 +239,14 @@ ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
 
 
 class LlamaRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+    ):
         super().__init__()
         self.scaling_factor = scaling_factor
         self.dim = dim
@@ -305,9 +320,7 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
             base = self.base * (
                 (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
             ) ** (self.dim / (self.dim - 2))
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim)
-            )
+            inv_freq = 1.0 / (base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(x.device) / self.dim))
             self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: this may break with compilation
 
         cos, sin = super().forward(x, position_ids, seq_len)
@@ -347,7 +360,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+
 _mlp_printed = False
+
+
 class LlamaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -359,31 +375,35 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
         self.tp_on = False
-    
+
     def set_tp(self, comm_group: dist.ProcessGroupNCCL):
         """Enable tensor parallel by spliting weights"""
         world_size = dist.get_world_size(comm_group)
         rank = dist.get_rank(comm_group)
         tp_size = self.config.tp_size
-        assert world_size == tp_size, f"You have a bug in your TP group size! world_size ({world_size}) != tp_size ({tp_size})"
+        assert (
+            world_size == tp_size
+        ), f"You have a bug in your TP group size! world_size ({world_size}) != tp_size ({tp_size})"
         self.tp_on = True
         self.comm_group = comm_group
-        
-        column_parallel_list = {"gate_proj": self.gate_proj, "up_proj": self.up_proj}    
+
+        column_parallel_list = {"gate_proj": self.gate_proj, "up_proj": self.up_proj}
         for name, module in column_parallel_list.items():
             module = ColumnParallelLinear(module.weight, module.bias, comm_group)
             setattr(self, name, module)
-        
+
         # Row parallel the second FC
         original_shape = self.down_proj.weight.shape
         self.down_proj = RowParallelLinear(self.down_proj.weight, self.down_proj.bias, comm_group)
-        
+
         if self.config.debug_mode:
             global _mlp_printed
             if not _mlp_printed:
                 _mlp_printed = True
-                print(f"rank {rank} Row Parallel shape:{self.down_proj.weight.shape}. Original shape: {original_shape} ")
-        
+                print(
+                    f"rank {rank} Row Parallel shape:{self.down_proj.weight.shape}. Original shape: {original_shape} "
+                )
+
     def forward(self, x):
         # if self.config.pretraining_tp > 1:
         #     rank = dist.get_rank()
@@ -451,8 +471,16 @@ class LlamaAttention(nn.Module):
             )
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
         self._init_rope()
 
@@ -656,7 +684,12 @@ class LlamaFlashAttention2(LlamaAttention):
             value_states = value_states.to(target_dtype)
 
         attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            dropout=dropout_rate,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -668,7 +701,14 @@ class LlamaFlashAttention2(LlamaAttention):
         return attn_output, attn_weights, past_key_value
 
     def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        query_length,
+        dropout=0.0,
+        softmax_scale=None,
     ):
         """
         Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
@@ -698,9 +738,14 @@ class LlamaFlashAttention2(LlamaAttention):
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
             batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
-            )
+            (
+                query_states,
+                key_states,
+                value_states,
+                indices_q,
+                cu_seq_lens,
+                max_seq_lens,
+            ) = self._upad_input(query_states, key_states, value_states, attention_mask, query_length)
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
@@ -721,7 +766,12 @@ class LlamaFlashAttention2(LlamaAttention):
             attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
         else:
             attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=causal
+                query_states,
+                key_states,
+                value_states,
+                dropout,
+                softmax_scale=softmax_scale,
+                causal=causal,
             )
 
         return attn_output
@@ -731,14 +781,17 @@ class LlamaFlashAttention2(LlamaAttention):
         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
 
         key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
+            indices_k,
         )
         value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
+            indices_k,
         )
         if query_length == kv_seq_len:
             query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim), indices_k
+                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim),
+                indices_k,
             )
             cu_seqlens_q = cu_seqlens_k
             max_seqlen_in_batch_q = max_seqlen_in_batch_k
@@ -982,14 +1035,21 @@ class LlamaPreTrainedModel(PreTrainedModel):
 
         if max_cache_len > self.model.causal_mask.shape[-1] or self.device != self.model.causal_mask.device:
             causal_mask = torch.full(
-                (max_cache_len, max_cache_len), fill_value=True, device=self.device, dtype=torch.bool
+                (max_cache_len, max_cache_len),
+                fill_value=True,
+                device=self.device,
+                dtype=torch.bool,
             )
             self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
 
         for layer in self.model.layers:
             weights = layer.self_attn.o_proj.weight
             layer.self_attn.past_key_value = cache_cls(
-                self.config, max_batch_size, max_cache_len, device=weights.device, dtype=weights.dtype
+                self.config,
+                max_batch_size,
+                max_cache_len,
+                device=weights.device,
+                dtype=weights.dtype,
             )
 
     def _reset_cache(self):
@@ -1094,16 +1154,18 @@ class LlamaModel(LlamaPreTrainedModel):
         # Register a causal mask to separate causal and padding mask creation. Merging happens in the attention class.
         # NOTE: This is not friendly with TorchScript, ONNX, ExportedProgram serialization for very large `max_position_embeddings`.
         causal_mask = torch.full(
-            (config.max_position_embeddings, config.max_position_embeddings), fill_value=True, dtype=torch.bool
+            (config.max_position_embeddings, config.max_position_embeddings),
+            fill_value=True,
+            dtype=torch.bool,
         )
         self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
         # Initialize weights and apply final processing
         self.post_init()
-    
+
     # def set_tp(self, comm_group: dist.ProcessGroup, tp: int):
     #     """ Parallelize the embedding layer"""
     #     pass
-        
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -1153,7 +1215,9 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if cache_position is None:
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
             )
 
         if position_ids is None:
@@ -1235,7 +1299,10 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # support going beyond cached `max_position_embedding`
         if seq_length > self.causal_mask.shape[-1]:
-            causal_mask = torch.full((2 * self.causal_mask.shape[-1], 2 * self.causal_mask.shape[-1]), fill_value=1)
+            causal_mask = torch.full(
+                (2 * self.causal_mask.shape[-1], 2 * self.causal_mask.shape[-1]),
+                fill_value=1,
+            )
             self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
 
         # We use the current dtype to avoid any overflows
@@ -1282,7 +1349,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         self.tp_on = True
         self.lm_head = ColumnParallelLinear(self.lm_head.weight, self.lm_head.bias, comm_group)
 
-        
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -1400,7 +1466,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
     ):
         past_length = 0
         if past_key_values is not None:
@@ -1452,7 +1523,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         # TODO @gante we should only keep a `cache_position` in generate, and do +=1.
         # same goes for position ids. Could also help with continued generation.
-        cache_position = torch.arange(past_length, past_length + position_ids.shape[-1], device=position_ids.device)
+        cache_position = torch.arange(
+            past_length,
+            past_length + position_ids.shape[-1],
+            device=position_ids.device,
+        )
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:

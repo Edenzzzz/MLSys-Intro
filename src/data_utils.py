@@ -1,16 +1,14 @@
-from typing import Dict, Optional, Sequence
-import json
-from transformers import (
-    PreTrainedTokenizer,
-    PreTrainedModel,
-)
-import tqdm 
 import copy
-import logging 
+import json
+import logging
 import os
+from typing import Dict, Sequence
+
 import torch
-from torch.utils.data import Dataset
 import torch.distributed as dist
+import tqdm
+from torch.utils.data import Dataset
+from transformers import PreTrainedModel, PreTrainedTokenizer
 
 IGNORE_INDEX = -100
 PAD_TOKEN = "[PAD]"
@@ -42,20 +40,20 @@ def resize_tokenizer_embedding(
     num_new_tokens = tokenizer.add_special_tokens(new_tokens)
     if num_new_tokens > 0:
         model.resize_token_embeddings(len(tokenizer))
-        
+
         # Assign new embeddings the average value
         in_embeddings = model.get_input_embeddings().weight.data
         out_embeddings = model.get_output_embeddings().weight.data
-        in_embeddings_avg = in_embeddings[ :-num_new_tokens].mean(dim=0, keepdim=True)
-        out_embeddings_avg = out_embeddings[ :-num_new_tokens].mean(dim=0, keepdim=True)
-        
-        in_embeddings[-num_new_tokens: ] = in_embeddings_avg
-        out_embeddings[-num_new_tokens: ] = out_embeddings_avg
-        
+        in_embeddings_avg = in_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        out_embeddings_avg = out_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+        in_embeddings[-num_new_tokens:] = in_embeddings_avg
+        out_embeddings[-num_new_tokens:] = out_embeddings_avg
+
 
 def tokenize(string: Sequence[str], tokenizer: PreTrainedTokenizer) -> Dict:
-    """ Tokenizer a list of strings"""
-    
+    """Tokenizer a list of strings"""
+
     tokenized_list = [
         tokenizer(
             text,
@@ -66,7 +64,7 @@ def tokenize(string: Sequence[str], tokenizer: PreTrainedTokenizer) -> Dict:
         )
         for text in string
     ]
-    
+
     input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
     input_ids_lens = labels_lens = [
         tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
@@ -77,26 +75,38 @@ def tokenize(string: Sequence[str], tokenizer: PreTrainedTokenizer) -> Dict:
         input_ids_lens=input_ids_lens,
         labels_lens=labels_lens,
     )
-    
-    
+
+
 def preprocess(
     sources: Sequence[str],
     targets: Sequence[str],
     tokenizer: PreTrainedTokenizer,
+    path: str = "alpaca_tokenized.pt",
 ) -> Dict:
     """Preprocess the data by tokenizing."""
-    
+
     examples = [s + t for s, t in zip(sources, targets)]
-    if not os.path.exists("alpaca_tokenized.pt"):
-        tokenized = [tokenize(strings, tokenizer) for strings in tqdm.tqdm((examples, sources), desc="Tokenizing")]
-        torch.save(tokenized, "alpaca_tokenized.pt")
-    else:
-        tokenized = torch.load("alpaca_tokenized.pt")
-    
-    examples_tokenized, sources_tokenized = tokenized 
+
+    def _tokenize_all():
+        if not os.path.exists(path):
+            tokenized = [tokenize(strings, tokenizer) for strings in tqdm.tqdm((examples, sources), desc="Tokenizing")]
+            torch.save(tokenized, path)
+        else:
+            tokenized = torch.load(path)
+        return tokenized
+
+    # Only preprocess on rank 0 and put others waiting on barrier
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            tokenized = _tokenize_all()
+        dist.barrier()
+        if dist.get_rank() != 0:
+            tokenized = torch.load(path)
+
+    examples_tokenized, sources_tokenized = tokenized
     input_ids = examples_tokenized["input_ids"]
     labels = copy.deepcopy(input_ids)
-    
+
     for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
         label[:source_len] = IGNORE_INDEX
     return dict(input_ids=input_ids, labels=labels)
@@ -104,16 +114,24 @@ def preprocess(
 
 class SFTDataset(Dataset):
     """Dataset for supervised fine-tuning"""
-    
+
     def __init__(self, data_path: str, tokenizer: PreTrainedTokenizer):
         super(SFTDataset, self).__init__()
+
         logging.warning("Loading data...")
         list_data_dict = json.load(open(data_path, "r"))
-
         logging.warning("Formatting inputs...")
-        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+
+        prompt_input, prompt_no_input = (
+            PROMPT_DICT["prompt_input"],
+            PROMPT_DICT["prompt_no_input"],
+        )
         sources = [
-            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
+            (
+                prompt_input.format_map(example)
+                if example.get("input", "") != ""
+                else prompt_no_input.format_map(example)
+            )
             for example in list_data_dict
         ]
         targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
@@ -129,14 +147,14 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         return dict(input_ids=self.input_ids[i], labels=self.labels[i])
-    
 
-class SFTDataCollator():
+
+class SFTDataCollator:
     """Collate batch for SFT"""
-    
+
     def __init__(self, tokenizer: PreTrainedTokenizer):
         self.tokenizer = tokenizer
-    
+
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -148,20 +166,21 @@ class SFTDataCollator():
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
-        
+
 
 class Accuracy:
     "A simple Accuracy function compatible with HF models"
+
     def __init__(self):
         self.count = 0
-        self.tp = 0.
-        
+        self.tp = 0.0
+
     def update(self, logits: torch.Tensor, labels: torch.Tensor):
         logits, labels = logits.argmax(dim=-1).view(-1).cpu(), labels.view(-1).cpu()
         tp = (logits == labels).sum()
         self.count += len(logits)
         self.tp += tp
         return tp / len(logits)
-    
+
     def compute(self):
         return self.tp / self.count
