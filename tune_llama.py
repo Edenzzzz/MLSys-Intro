@@ -7,22 +7,37 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import transformers
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import (LlamaConfig, LlamaTokenizer, PreTrainedTokenizer,
-                          TrainingArguments, get_cosine_schedule_with_warmup)
+from transformers import (
+    LlamaConfig,
+    LlamaTokenizer,
+    PreTrainedTokenizer,
+    TrainingArguments,
+    get_cosine_schedule_with_warmup,
+)
 
 from src.data_utils import *
-from src.modeling_llama import LlamaForCausalLM
+from src.modeling_llama import LlamaForCausalLM, tp_modules
 
 
-def manual_reduction(model, group: dist.ProcessGroupNCCL, average: bool = False):
+def manual_reduction(
+    model: nn.Module,
+    group: dist.ProcessGroupNCCL = None,
+    is_tp: bool = False,
+    average: bool = True,
+):
     """Manually reduce the gradient within a group. I suspect DDP's backward is buggy when there are multiple process groups."""
-    for param in model.parameters():
+    for name, param in model.named_parameters():
+        # TP layers already have grads synchronized, just all-reduce non-parallel ones
+        if is_tp and any([tp_name in name for tp_name in tp_modules]):
+            continue
+
         if param.requires_grad and param.grad is not None:
             # All-reduce gradients manually within the specified group
             dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, group=group)
@@ -32,20 +47,34 @@ def manual_reduction(model, group: dist.ProcessGroupNCCL, average: bool = False)
 
 def init_dist(dp_size: int = -1) -> List[dist.ProcessGroupNCCL]:
     dp_size = int(os.environ["WORLD_SIZE"]) if dp_size == -1 else dp_size
-    rank = int(os.environ["RANK"])
+    rank = int(os.environ["LOCAL_RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
+    tp_size = world_size // dp_size
 
     dist.init_process_group(world_size=world_size, rank=rank, init_method="env://", backend="nccl")
     torch.cuda.set_device(local_rank)
 
     # Set up Tensor Parallel within each Data Parallel group
-    tp_size = world_size // dp_size
+    tp_groups = dp_groups = None
     if dp_size > 1:
         tp_groups = [
             dist.new_group(ranks=range(group_id * tp_size, (group_id + 1) * tp_size)) for group_id in range(dp_size)
         ]
-        return tp_groups
+
+    # Set up Data Parallel groups across Tensor Parallel groups
+    # e.g. 4 GPUs, 2 TP groups, 2 DP groups, rank = {0, 1, 2, 3}
+    # TP groups: {0, 1}, {2, 3}
+    # DP groups: {0, 2}, {1, 3}
+    if tp_size > 1:
+        dp_groups = [dist.new_group(ranks=range(i, world_size, tp_size)) for i in range(tp_size)]
+
+    # Assign each rank a TP and DP group
+    rank = int(os.environ["LOCAL_RANK"])
+    tp_group = tp_groups[rank // tp_size] if tp_groups is not None else None
+    dp_group = dp_groups[rank % dp_size] if dp_groups is not None else None
+
+    return tp_group, dp_group
 
 
 @dataclass
@@ -57,6 +86,10 @@ class ModelArguments:
     tp_size: int = field(default=1, metadata={"help": "Size of tensor parallel groups."})
     dp_size: int = field(default=1, metadata={"help": "Size of data parallel groups."})
     debug_mode: bool = field(default=False, metadata={"help": "Debug by printing layer info etc."})
+    manual_dp: bool = field(
+        default=True,
+        metadata={"help": "Manually reduce gradients instead of using torch.DDP."},
+    )
 
 
 @dataclass
@@ -96,10 +129,6 @@ class TrainingArguments(TrainingArguments):
     output_dir: str = "checkpoints"
 
 
-def to_gpu(tensor_dict):
-    return {k: v.to("cuda", non_blocking=True) for k, v in tensor_dict.items()}
-
-
 def get_data(tokenizer: PreTrainedTokenizer, data_args: DataArguments) -> Dict:
     train_dataset = SFTDataset(data_args.data_path, tokenizer)
     collator = SFTDataCollator(tokenizer)
@@ -110,31 +139,26 @@ def loss_fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(x.reshape(-1, x.shape[-1]), y.reshape(-1))
 
 
-def generate(model, prompt, tokenizer, max_new_tokens=100):
-    with torch.inference_mode():
-        tokenized_prompt = tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
-        output = model.generate(tokenized_prompt, max_new_tokens=max_new_tokens)
-    return tokenizer.decode(output[0][len(tokenized_prompt[0]) :], skip_special_tokens=True)
-
-
-def main(tp_groups: List[dist.ProcessGroupNCCL] = None):
+def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    tp_size = model_args.tp_size
+    dp_size = model_args.dp_size
+
     world_size = int(os.environ["WORLD_SIZE"])
     assert (
-        world_size == model_args.tp_size * model_args.dp_size
-    ), f"Num DP groups * TP size must equal num devices, but we have {os.environ['WORLD_SIZE']} != {model_args.tp_size * model_args.dp_size}"
+        world_size == tp_size * dp_size
+    ), f"Num DP groups * TP size must equal num devices, but we have {os.environ['WORLD_SIZE']} != {tp_size * dp_size}"
 
     # Setup NCCL Comm groups
     rank = int(os.environ["LOCAL_RANK"])
-    this_group = tp_groups[rank // model_args.tp_size] if tp_groups is not None else None
 
     # Load model and set up parallelism
     config = LlamaConfig.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir)
-    config.tp_size = model_args.tp_size
+    config.tp_size = tp_size
     config.debug_mode = model_args.debug_mode
 
-    # config.comm_group = this_group
+    # config.comm_group = tp_group
     model = LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -145,14 +169,14 @@ def main(tp_groups: List[dist.ProcessGroupNCCL] = None):
     if config.tp_size > 1:
         for module in model.modules():
             if hasattr(module, "set_tp"):
-                module.set_tp(comm_group=this_group)
+                module.set_tp(comm_group=tp_group)
 
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
     # Save memory by freezing params
     # Dumb pytorch won't allow partially freezing in DDP
-    if not model_args.dp_size > 1:
+    if not dp_size > 1:
         n_freeze = 15
         for param in model.parameters():
             param.requires_grad = False
@@ -177,7 +201,6 @@ def main(tp_groups: List[dist.ProcessGroupNCCL] = None):
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = PAD_TOKEN
-
     resize_tokenizer_embedding(
         new_tokens=special_tokens_dict,
         tokenizer=tokenizer,
@@ -191,19 +214,21 @@ def main(tp_groups: List[dist.ProcessGroupNCCL] = None):
             if param.device == torch.device("cpu"):
                 print(name, "is not on GPU!!")
 
-    if model_args.dp_size > 1:
-        device = "cuda:" + os.environ["RANK"]
-        model = DDP(model, device_ids=[device], output_device=device, process_group=this_group)
+    # NOTE: test manually reduce gradients
+    if dp_size > 1 and not model_args.manual_dp:
+        # Must NOT set device with MP + DP, as instructed by torch docs (https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)
+        if tp_size > 1:
+            model = DDP(model)
 
     # Set up data, optimizer, scheduler
     train_dataset, data_collator = get_data(tokenizer=tokenizer, data_args=data_args)
     sampler = (
         DistributedSampler(
             train_dataset,
-            num_replicas=model_args.dp_size,
-            rank=rank // model_args.tp_size,
+            num_replicas=dp_size,
+            rank=rank // tp_size,
         )
-        if model_args.dp_size > 1
+        if dp_size > 1
         else None
     )
     train_loader = DataLoader(
@@ -231,6 +256,8 @@ def main(tp_groups: List[dist.ProcessGroupNCCL] = None):
     acc = Accuracy()
     model.train()
     train_step = 0
+
+    # Set mixed precision
     if training_args.bf16:
         dtype = torch.bfloat16
     elif training_args.fp16:
@@ -240,6 +267,10 @@ def main(tp_groups: List[dist.ProcessGroupNCCL] = None):
 
     if rank == 0:
         pbar = tqdm.tqdm(total=total_steps)
+        print(
+            f"Actual batch size: {training_args.per_device_training_batch_size * dp_size * training_args.gradient_accumulation_steps}"
+        )
+
     for epoch in range(training_args.epochs):
         if sampler:
             train_loader.sampler.set_epoch(epoch)
@@ -248,9 +279,15 @@ def main(tp_groups: List[dist.ProcessGroupNCCL] = None):
             with torch.amp.autocast("cuda", dtype=dtype):
                 out = model(**batch)
                 loss = loss_fn(out.logits, batch["labels"]) / training_args.grad_accumulation_steps
-                dist.barrier(group=this_group)
                 loss.backward()  # TODO: DDP + TP could hang during backward??
-                dist.barrier(group=this_group)
+
+                # All-reduce grads of non-parallel modules
+                if tp_size > 1:
+                    manual_reduction(model, tp_group, is_tp=True)
+
+                # All-reduce across DP groups
+                if model_args.manual_dp and dp_size > 1:
+                    manual_reduction(model, dp_group)
 
             if step % training_args.grad_accumulation_steps == 0:
                 optim.step()
@@ -281,5 +318,5 @@ if __name__ == "__main__":
         dp_index = sys.argv.index("--dp_size")
         dp_size = int(sys.argv[dp_index + 1])
 
-    tp_groups = init_dist(dp_size)
-    main(tp_groups)
+    tp_group, dp_group = init_dist(dp_size)
+    main(tp_group, dp_group)

@@ -30,28 +30,34 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from transformers.modeling_outputs import (BaseModelOutputWithPast,
-                                           CausalLMOutputWithPast,
-                                           QuestionAnsweringModelOutput,
-                                           SequenceClassifierOutputWithPast)
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+    QuestionAnsweringModelOutput,
+    SequenceClassifierOutputWithPast,
+)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
-from transformers.utils import (add_start_docstrings,
-                                add_start_docstrings_to_model_forward,
-                                is_flash_attn_2_available,
-                                is_flash_attn_greater_or_equal_2_10, logging,
-                                replace_return_docstrings)
+from transformers.utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    is_flash_attn_2_available,
+    is_flash_attn_greater_or_equal_2_10,
+    logging,
+    replace_return_docstrings,
+)
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import (index_first_axis, pad_input,  # noqa
-                                         unpad_input)
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
+
+tp_modules = ["down_proj", "gate_proj", "up_proj", "lm_head"]
 
 
 def _reduce(input_: torch.Tensor, group: dist.ProcessGroupNCCL):
@@ -153,13 +159,11 @@ class ColumnParallelLinear(nn.Linear):
         ), f"The out size must be divisible by the parallel size in TP, but we have {out_shape} / {tp_size}"
 
         self.group = group
-        self.weight = weight
-        self.bias = bias
 
         # Split weights for TP
-        self.weight = nn.Parameter(self.weight.split(out_shape_split, dim=0)[self.rank].clone())
-        if self.bias is not None:
-            self.bias = nn.Parameter(self.bias.split(out_shape_split, dim=0)[self.rank].clone())
+        self.weight = nn.Parameter(weight.split(out_shape_split, dim=0)[self.rank].clone())
+        if bias is not None:
+            self.bias = nn.Parameter(bias.split(out_shape_split, dim=0)[self.rank].clone())
 
     def forward(self, input_: torch.Tensor):
         input_ = _ToModelParallel.apply(input_, self.group)
@@ -186,22 +190,17 @@ class RowParallelLinear(nn.Linear):
         ), f"The in size must be divisible by the parallel size in TP, but we have {in_shape} / {tp_size}"
 
         self.group = group
-        self.weight = weight
         self.bias = (
             nn.Parameter(bias) if (self.rank == 0 and bias is not None) else None
-        )  # Only one rank needs to hold bias as the output dim is not split
+        )  # Only one rank holds bias as the output dim is not split
 
         # Split weights
         in_shape_split = in_shape // tp_size
-        self.weight = nn.Parameter(self.weight.split(in_shape_split, dim=1)[self.rank].clone())
+        self.weight = nn.Parameter(weight.split(in_shape_split, dim=1)[self.rank].clone())
         # print(f"rank {rank} Row Parallel weight shape: {self.weight.shape}")
 
     def forward(self, input_: torch.Tensor):
-        try:
-            output = F.linear(input_, self.weight, self.bias)  # out = xW^T + b
-        except:
-            print(f"rank {self.rank} input: {input_.shape}, weight: {self.weight.shape}, bias: {self.bias.shape}")
-            exit(1)
+        output = F.linear(input_, self.weight, self.bias)  # out = xW^T + b
         output = _ReduceFromModelParallel.apply(output, self.group)
         return output
 

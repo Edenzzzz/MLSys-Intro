@@ -184,3 +184,14 @@ class Accuracy:
 
     def compute(self):
         return self.tp / self.count
+
+
+def generate(model, prompt, tokenizer, max_new_tokens=100):
+    with torch.inference_mode():
+        tokenized_prompt = tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
+        output = model.generate(tokenized_prompt, max_new_tokens=max_new_tokens)
+    return tokenizer.decode(output[0][len(tokenized_prompt[0]) :], skip_special_tokens=True)
+
+
+def to_gpu(tensor_dict):
+    return {k: v.to("cuda", non_blocking=True) for k, v in tensor_dict.items()}
