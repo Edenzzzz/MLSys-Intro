@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import transformers
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
@@ -214,11 +213,11 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
             if param.device == torch.device("cpu"):
                 print(name, "is not on GPU!!")
 
-    # NOTE: test manually reduce gradients
-    if dp_size > 1 and not model_args.manual_dp:
-        # Must NOT set device with MP + DP, as instructed by torch docs (https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)
-        if tp_size > 1:
-            model = DDP(model)
+    # # NOTE: test manually reduce gradients
+    # if dp_size > 1 and not model_args.manual_dp:
+    #     # Must NOT set device with MP + DP, as instructed by torch docs (https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)
+    #     if tp_size > 1:
+    #         model = DDP(model)
 
     # Set up data, optimizer, scheduler
     train_dataset, data_collator = get_data(tokenizer=tokenizer, data_args=data_args)
@@ -279,7 +278,7 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
             with torch.amp.autocast("cuda", dtype=dtype):
                 out = model(**batch)
                 loss = loss_fn(out.logits, batch["labels"]) / training_args.grad_accumulation_steps
-                loss.backward()  # TODO: DDP + TP could hang during backward??
+                loss.backward()
 
                 # All-reduce grads of non-parallel modules
                 if tp_size > 1:

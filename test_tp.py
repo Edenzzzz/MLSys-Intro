@@ -80,8 +80,9 @@ def test_tp_correctness(size):
     bias_1_grad = net.bias_1.grad[start:end]
     bias_2_grad = net.bias_2.grad
     assert_close(bias_1_grad, tp1.bias.grad, atol=atol, rtol=rtol)
+
+    # Row Parallel doesn NOT split bias
     if rank == 0:
-        # Row Parallel doesn NOT split bias
         assert_close(bias_2_grad, tp2.bias.grad, atol=atol, rtol=rtol)
     assert_close(net.bias_0.grad, tp0.bias.grad, atol=atol, rtol=rtol)
 
