@@ -7,8 +7,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.testing import assert_close
 
-from src.modeling_llama import *
-from tune_llama import init_dist, manual_reduction
+from ..src.modeling_llama import *
+from ..tune_llama import init_dist, manual_reduction
 
 
 class Net(nn.Module):

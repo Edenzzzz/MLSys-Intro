@@ -3,7 +3,7 @@
 # Ex: torchrun --nproc_per_node 4 master_port 25555 tune_llama.py --dp_size 2 --tp_size 2
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import transformers
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
@@ -21,7 +22,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-from src.data_utils import *
+from src.dist_utils import *
 from src.modeling_llama import LlamaForCausalLM, tp_modules
 
 
@@ -31,7 +32,7 @@ def manual_reduction(
     is_tp: bool = False,
     average: bool = True,
 ):
-    """Manually reduce the gradient within a group. I suspect DDP's backward is buggy when there are multiple process groups."""
+    """Manually all-reduce the gradient within a group. I suspect DDP's backward is buggy with multiple process groups."""
     for name, param in model.named_parameters():
         # TP layers already have grads synchronized, just all-reduce non-parallel ones
         if is_tp and any([tp_name in name for tp_name in tp_modules]):
@@ -42,38 +43,6 @@ def manual_reduction(
             dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, group=group)
             if average:
                 param.grad.data /= dist.get_world_size(group)
-
-
-def init_dist(dp_size: int = -1) -> List[dist.ProcessGroupNCCL]:
-    dp_size = int(os.environ["WORLD_SIZE"]) if dp_size == -1 else dp_size
-    rank = int(os.environ["LOCAL_RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    tp_size = world_size // dp_size
-
-    dist.init_process_group(world_size=world_size, rank=rank, init_method="env://", backend="nccl")
-    torch.cuda.set_device(local_rank)
-
-    # Set up Tensor Parallel within each Data Parallel group
-    tp_groups = dp_groups = None
-    if dp_size > 1:
-        tp_groups = [
-            dist.new_group(ranks=range(group_id * tp_size, (group_id + 1) * tp_size)) for group_id in range(dp_size)
-        ]
-
-    # Set up Data Parallel groups across Tensor Parallel groups
-    # e.g. 4 GPUs, 2 TP groups, 2 DP groups, rank = {0, 1, 2, 3}
-    # TP groups: {0, 1}, {2, 3}
-    # DP groups: {0, 2}, {1, 3}
-    if tp_size > 1:
-        dp_groups = [dist.new_group(ranks=range(i, world_size, tp_size)) for i in range(tp_size)]
-
-    # Assign each rank a TP and DP group
-    rank = int(os.environ["LOCAL_RANK"])
-    tp_group = tp_groups[rank // tp_size] if tp_groups is not None else None
-    dp_group = dp_groups[rank % dp_size] if dp_groups is not None else None
-
-    return tp_group, dp_group
 
 
 @dataclass
@@ -175,7 +144,7 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
 
     # Save memory by freezing params
     # Dumb pytorch won't allow partially freezing in DDP
-    if not dp_size > 1:
+    if model_args.manual_dp:
         n_freeze = 15
         for param in model.parameters():
             param.requires_grad = False
@@ -183,8 +152,7 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
             param.requires_grad = True
         for param in model.model.layers[n_freeze:].parameters():
             param.requires_grad = True
-    if rank == 0:
-        print("Config: ", model.config)
+    print_once("Config: ", model.config)
 
     # Load vocab and tokenizer
     tokenizer = LlamaTokenizer.from_pretrained(
@@ -206,18 +174,16 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
         model=model,
     )
 
-    model = model.cuda()
-    # Check for bug in DDP
+    # print(f"rank {rank} before loading model, free memory remaining: {torch.cuda.mem_get_info()[0] / 1e9} GB")
+    model = model.to(f"cuda:{rank}")
+    # print(f"rank: {rank} model loaded on GPU, free memory remaining: {torch.cuda.mem_get_info()[0] / 1e9} GB")
     if rank == 0:
-        for name, param in model.named_parameters():
-            if param.device == torch.device("cpu"):
-                print(name, "is not on GPU!!")
+        check_on_gpu(model)
 
-    # # NOTE: test manually reduce gradients
-    # if dp_size > 1 and not model_args.manual_dp:
-    #     # Must NOT set device with MP + DP, as instructed by torch docs (https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)
-    #     if tp_size > 1:
-    #         model = DDP(model)
+    if dp_size > 1 and not model_args.manual_dp:
+        # Must NOT set device with MP + DP, as instructed here (https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)
+        if tp_size > 1:
+            model = DDP(model)
 
     # Set up data, optimizer, scheduler
     train_dataset, data_collator = get_data(tokenizer=tokenizer, data_args=data_args)
@@ -270,9 +236,11 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
             f"Actual batch size: {training_args.per_device_training_batch_size * dp_size * training_args.gradient_accumulation_steps}"
         )
 
+    # torch.cuda.memory._record_memory_history()
     for epoch in range(training_args.epochs):
         if sampler:
             train_loader.sampler.set_epoch(epoch)
+
         for step, batch in enumerate(train_loader):
             batch = to_gpu(batch)
             with torch.amp.autocast("cuda", dtype=dtype):
@@ -281,9 +249,9 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
                 loss.backward()
 
                 # All-reduce grads of non-parallel modules
+                # NOTE: all-reduce costs little memory
                 if tp_size > 1:
                     manual_reduction(model, tp_group, is_tp=True)
-
                 # All-reduce across DP groups
                 if model_args.manual_dp and dp_size > 1:
                     manual_reduction(model, dp_group)
@@ -291,7 +259,7 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
             if step % training_args.grad_accumulation_steps == 0:
                 optim.step()
                 scheduler.step()
-                optim.zero_grad(set_to_none=True)
+                optim.zero_grad()
                 train_step += 1
 
                 # Update tqdm postfix with training metrics
@@ -305,8 +273,8 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
                         },
                         refresh=True,
                     )
-            if rank == 0:
-                pbar.update(1)
+                if rank == 0:
+                    pbar.update(1)
 
 
 if __name__ == "__main__":

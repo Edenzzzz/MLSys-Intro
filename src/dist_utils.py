@@ -2,19 +2,75 @@ import copy
 import json
 import logging
 import os
-from typing import Dict, Sequence
+from typing import Dict, List, Sequence
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import tqdm
 from torch.utils.data import Dataset
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
+
+def init_dist(dp_size: int = -1) -> List[dist.ProcessGroupNCCL]:
+    """
+    Initialize distributed training, with optional Data Parallel and Tensor Parallel sizes.
+    Arguments:
+        dp_size: Number of data parallel groups. By default will not use DP  and will use
+            all devices for TP.
+    """
+
+    dp_size = int(os.environ["WORLD_SIZE"]) if dp_size == -1 else dp_size
+    rank = int(os.environ["LOCAL_RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    tp_size = world_size // dp_size
+
+    dist.init_process_group(world_size=world_size, rank=rank, init_method="env://", backend="nccl")
+    torch.cuda.set_device(local_rank)
+
+    # Set up Tensor Parallel groups
+    tp_groups = dp_groups = None
+    if dp_size > 1:
+        tp_groups = [
+            dist.new_group(ranks=range(group_id * tp_size, (group_id + 1) * tp_size)) for group_id in range(dp_size)
+        ]
+
+    # Set up Data Parallel across Tensor Parallel groups
+    # e.g. 4 GPUs, 2 TP groups, 2 DP groups, rank = {0, 1, 2, 3}
+    # TP groups: {0, 1}, {2, 3}
+    # DP groups: {0, 2}, {1, 3}
+    if tp_size > 1:
+        dp_groups = [dist.new_group(ranks=range(i, world_size, tp_size)) for i in range(tp_size)]
+
+    # Assign each rank a TP and DP group
+    rank = int(os.environ["LOCAL_RANK"])
+    tp_group = tp_groups[rank // tp_size] if tp_groups is not None else None
+    dp_group = dp_groups[rank % dp_size] if dp_groups is not None else None
+
+    return tp_group, dp_group
+
+
+def to_gpu(tensor_dict):
+    device = dist.get_rank() if dist.is_initialized() else "cuda"
+    return {k: v.to(device, non_blocking=True) for k, v in tensor_dict.items()}
+
+
+def print_once(*message: str):
+    """Ensure printing only once in a distributed setting"""
+    if (not dist.is_initialized()) or dist.get_rank() == 0:
+        print(*message)
+
+
+def check_on_gpu(model: nn.Module):
+    for name, param in model.named_parameters():
+        if param.device == torch.device("cpu"):
+            print(name, "is not on GPU!!")
+
+
+####################### Llama utils #######################
 IGNORE_INDEX = -100
 PAD_TOKEN = "[PAD]"
-EOS_TOKEN = "</s>"
-BOS_TOKEN = "<s>"
-UNK_TOKEN = "<unk>"
 PROMPT_DICT = {
     "prompt_input": (
         "Below is an instruction that describes a task, paired with an input that provides further context. "
@@ -191,7 +247,3 @@ def generate(model, prompt, tokenizer, max_new_tokens=100):
         tokenized_prompt = tokenizer(prompt, return_tensors="pt")["input_ids"].cuda()
         output = model.generate(tokenized_prompt, max_new_tokens=max_new_tokens)
     return tokenizer.decode(output[0][len(tokenized_prompt[0]) :], skip_special_tokens=True)
-
-
-def to_gpu(tensor_dict):
-    return {k: v.to("cuda", non_blocking=True) for k, v in tensor_dict.items()}
