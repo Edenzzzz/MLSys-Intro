@@ -137,7 +137,7 @@ def preprocess(
     sources: Sequence[str],
     targets: Sequence[str],
     tokenizer: PreTrainedTokenizer,
-    path: str = "alpaca_tokenized.pt",
+    path: str = "src/alpaca_tokenized.pt",
 ) -> Dict:
     """Preprocess the data by tokenizing."""
 
@@ -193,7 +193,8 @@ class SFTDataset(Dataset):
         targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
 
         logging.warning("Tokenizing inputs... This may take some time...")
-        data_dict = preprocess(sources, targets, tokenizer)
+        tokenized_path = os.path.dirname(data_path) + "/alpaca_tokenized.pt"
+        data_dict = preprocess(sources, targets, tokenizer, tokenized_path)
 
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]

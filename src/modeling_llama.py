@@ -1,3 +1,4 @@
+# TODO: Parallelize attention too
 # coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
@@ -27,7 +28,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss, init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_outputs import (
@@ -137,31 +138,46 @@ class _GatherFromModelParallel(torch.autograd.Function):
         return _split(grad_output, ctx.group), _grad_place_holder
 
 
+# lm_head is required to be nn.Linear object
 class ColumnParallelLinear(nn.Linear):
     def __init__(
         self,
-        weight: torch.Tensor,
+        weight: torch.Tensor = None,
         bias: torch.Tensor = None,
+        use_bias: bool = True,
         group: dist.ProcessGroupNCCL = None,
         gather_output: bool = False,
+        shape: Optional[Tuple[int, int]] = None,
     ):
+        """
+        Shard weights along the columns across devices for Tensor Parallel
+        Arguments:
+            shape: (out_shape, in_shape) following nn.Linear convention
+        """
         tp_size = dist.get_world_size(group)
-        out_shape = weight.shape[0]
+
+        # Split shape
+        assert shape != None or weight != None, "You must provide either a shape or weights"
+        shape = shape if shape is not None else weight.shape
+        out_shape = shape[0]
         out_shape_split = out_shape // tp_size
-        super().__init__(
-            in_features=weight.shape[1], out_features=out_shape_split
-        )  # lm_head is required to be nn.Linear object
+        super().__init__(in_features=shape[1], out_features=out_shape_split, bias=use_bias)
 
         self.gather_output = gather_output
         self.rank = dist.get_rank(group)
+        self.group = group
         assert (
             out_shape % tp_size == 0
         ), f"The out size must be divisible by the parallel size in TP, but we have {out_shape} / {tp_size}"
 
-        self.group = group
-
         # Split weights for TP
-        self.weight = nn.Parameter(weight.split(out_shape_split, dim=0)[self.rank].clone())
+        if weight is not None:
+            self.weight = nn.Parameter(weight.split(out_shape_split, dim=0)[self.rank].clone())
+        else:
+            # Init the assigned shard
+            self.weight = nn.Parameter(torch.empty(out_shape_split, shape[1]).to(self.rank))
+            init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
         if bias is not None:
             self.bias = nn.Parameter(bias.split(out_shape_split, dim=0)[self.rank].clone())
 
@@ -178,31 +194,52 @@ class RowParallelLinear(nn.Linear):
         self,
         weight: torch.Tensor,
         bias: torch.Tensor = None,
+        use_bias: bool = True,
         group: dist.ProcessGroupNCCL = None,
+        shape: Optional[Tuple[int, int]] = None,
     ):
+        """
+        Shard weights along the rows across devices for Tensor Parallel
+        Arguments:
+            shape: (out_shape, in_shape) following nn.Linear convention
+        """
+
         tp_size = dist.get_world_size(group)
-        in_shape = weight.shape[1]
-        super().__init__(in_features=in_shape, out_features=weight.shape[0])
+
+        # Split shape
+        shape = shape if shape is not None else weight.shape
+        in_shape = shape[1]
+        in_shape_split = in_shape // tp_size
+        super().__init__(in_features=in_shape_split, out_features=shape[0], bias=use_bias)
 
         self.rank = dist.get_rank(group)
+        self.group = group
         assert (
             in_shape % tp_size == 0
         ), f"The in size must be divisible by the parallel size in TP, but we have {in_shape} / {tp_size}"
 
-        self.group = group
-        self.bias = (
-            nn.Parameter(bias) if (self.rank == 0 and bias is not None) else None
-        )  # Only one rank holds bias as the output dim is not split
-
         # Split weights
-        in_shape_split = in_shape // tp_size
-        self.weight = nn.Parameter(weight.split(in_shape_split, dim=1)[self.rank].clone())
-        # print(f"rank {rank} Row Parallel weight shape: {self.weight.shape}")
+        if weight is not None:
+            self.weight = nn.Parameter(weight.split(in_shape_split, dim=1)[self.rank].clone())
+        else:
+            # Init the assigned shard
+            self.weight = nn.Parameter(torch.empty(shape[0], in_shape_split).to(self.rank))
+            init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+        # Keep full bias on each rank to avoid load-imbalance
+        if bias is not None:
+            self.bias = nn.Parameter(bias)
 
     def forward(self, input_: torch.Tensor):
-        output = F.linear(input_, self.weight, self.bias)  # out = xW^T + b
+        output = F.linear(input_, self.weight)  # out = xW^T + b
         output = _ReduceFromModelParallel.apply(output, self.group)
+        # Apply bias in every rank to avoid load in-balance
+        output = output if self.bias is None else output + self.bias
         return output
+
+
+# For easy reference & checking
+TP_CLASSES = [ColumnParallelLinear, RowParallelLinear]
 
 
 def _get_unpad_data(attention_mask):
@@ -1443,10 +1480,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            try:
-                shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            except:
-                breakpoint()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)

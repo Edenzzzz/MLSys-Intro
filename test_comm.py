@@ -129,9 +129,11 @@ class AllGather(CommOp):
         super().__init__(*args, **kwargs)
 
     def __call__(self, tensor: torch.Tensor) -> None:
-        input_chunks = list(torch.chunk(tensor, self.world_size, dim=0))
+        chunks = list(torch.chunk(tensor, self.world_size, dim=0))
+        input_chunk = chunks[dist.get_rank()]
+        output_chunk = chunks
         super().__call__(None)
-        dist.all_gather(input_chunks, input_chunks[dist.get_rank()], async_op=self.async_op)
+        dist.all_gather(output_chunk, input_chunk, async_op=self.async_op)
 
     def bw_factor(self):
         return (self.world_size - 1) / self.world_size

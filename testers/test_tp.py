@@ -1,14 +1,17 @@
 # Launch with torchrun to set tp size (nproc_per_node)
 # torchrun --nproc_per_node 4 --master_port 25555 test_tp.py --size 1000
 import argparse
+import os
+import sys
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.testing import assert_close
 
-from ..src.modeling_llama import *
-from ..tune_llama import init_dist, manual_reduction
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+from src.modeling_llama import *
+from tune_llama import all_reduce_grads, init_dist
 
 
 class Net(nn.Module):
@@ -39,7 +42,9 @@ def test_tp_correctness(size):
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     atol = 1e-5
-    rtol = 5e-2
+    # There's around 2 outliers due to over/under-flow in TP all-reduce.
+    # You could also replace torch.randn with torch.ones to see perfectly accurate results, w/o increasing threshold.
+    rtol = 5e-4
     torch.cuda.manual_seed(1)  # Fix randn results
 
     # Single device forward
@@ -65,7 +70,7 @@ def test_tp_correctness(size):
 
     # Check TP backward
     out_tp.sum().backward()
-    manual_reduction(tp0)
+    all_reduce_grads(tp0)
 
     # Check scattered gradient
     start = size // world_size * rank
@@ -85,7 +90,6 @@ def test_tp_correctness(size):
     if rank == 0:
         assert_close(bias_2_grad, tp2.bias.grad, atol=atol, rtol=rtol)
     assert_close(net.bias_0.grad, tp0.bias.grad, atol=atol, rtol=rtol)
-
     print("Backward passed!")
     dist.destroy_process_group()
 

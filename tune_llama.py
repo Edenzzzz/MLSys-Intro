@@ -2,6 +2,7 @@
 # Disclaimer: Referenced https://github.com/tatsu-lab/stanford_alpaca/tree/main/train.py
 # Ex: torchrun --nproc_per_node 4 master_port 25555 tune_llama.py --dp_size 2 --tp_size 2
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -26,7 +27,7 @@ from src.dist_utils import *
 from src.modeling_llama import LlamaForCausalLM, tp_modules
 
 
-def manual_reduction(
+def all_reduce_grads(
     model: nn.Module,
     group: dist.ProcessGroupNCCL = None,
     is_tp: bool = False,
@@ -54,6 +55,7 @@ class ModelArguments:
     tp_size: int = field(default=1, metadata={"help": "Size of tensor parallel groups."})
     dp_size: int = field(default=1, metadata={"help": "Size of data parallel groups."})
     debug_mode: bool = field(default=False, metadata={"help": "Debug by printing layer info etc."})
+    n_freeze: int = field(default=0, metadata={"help": "Number of layers to freeze."})
     manual_dp: bool = field(
         default=True,
         metadata={"help": "Manually reduce gradients instead of using torch.DDP."},
@@ -62,7 +64,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_path: str = field(default="alpaca_data.json", metadata={"help": "Path to the training data."})
+    data_path: str = field(default="src/alpaca_data.json", metadata={"help": "Path to the training data."})
 
 
 @dataclass
@@ -110,6 +112,15 @@ def loss_fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    training_args.output_dir += (
+        "/"
+        + "tp"
+        + str(model_args.tp_size)
+        + "_dp"
+        + str(model_args.dp_size)
+        + "_"
+        + time.strftime("%m-%d-%H", time.localtime())
+    )
     tp_size = model_args.tp_size
     dp_size = model_args.dp_size
 
@@ -145,7 +156,7 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
     # Save memory by freezing params
     # Dumb pytorch won't allow partially freezing in DDP
     if model_args.manual_dp:
-        n_freeze = 15
+        n_freeze = model_args.n_freeze
         for param in model.parameters():
             param.requires_grad = False
         for param in model.lm_head.parameters():
@@ -251,10 +262,10 @@ def main(tp_group: dist.ProcessGroupNCCL, dp_group: dist.ProcessGroupNCCL):
                 # All-reduce grads of non-parallel modules
                 # NOTE: all-reduce costs little memory
                 if tp_size > 1:
-                    manual_reduction(model, tp_group, is_tp=True)
+                    all_reduce_grads(model, tp_group, is_tp=True)
                 # All-reduce across DP groups
                 if model_args.manual_dp and dp_size > 1:
-                    manual_reduction(model, dp_group)
+                    all_reduce_grads(model, dp_group)
 
             if step % training_args.grad_accumulation_steps == 0:
                 optim.step()
