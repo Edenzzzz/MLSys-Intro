@@ -109,6 +109,10 @@ class LAMB(Optimizer):
         params["tp_dim"] = tp_dim
         self.add_param_group(params)
 
+    def setup_distributed(self, tp_group: dist.ProcessGroupNCCL, zero_group: dist.ProcessGroupNCCL):
+        self.tp_group = tp_group
+        self.zero_group = zero_group
+
     @torch.no_grad()
     def step(self, closure=None):
         """Performs a single optimization step.

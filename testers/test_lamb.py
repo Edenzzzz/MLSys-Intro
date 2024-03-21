@@ -13,6 +13,7 @@ from copy import deepcopy
 
 import torchvision
 import torchvision.transforms as transforms
+import tqdm
 from torch.testing import assert_close
 
 from src.dist_utils import init_dist
@@ -21,23 +22,30 @@ from src.modeling_llama import ColumnParallelLinear, RowParallelLinear
 
 _batch_size = 128
 _dim = 500
-_test_iter = 10
+_test_epochs = 4
 _lr = 1e-3
 _decay = 1e-4
 _seed = 1
 
 
-def load_cifar10():
+def assign_grads(model: nn.Module):
+    """Used for grad simulation in testing ZeRO2 + TP"""
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad = torch.randn_like(param)
+
+
+def load_cifar100():
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
     batch_size = 4
 
-    trainset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    trainset = torchvision.datasets.CIFAR100(root="./data", train=True, download=True, transform=transform)
     train_loader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True
     )
 
-    testset = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+    testset = torchvision.datasets.CIFAR100(root="./data", train=False, download=True, transform=transform)
     test_loader = torch.utils.data.DataLoader(
         testset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True
     )
@@ -128,37 +136,44 @@ def main(tp_group: dist.ProcessGroupNCCL = None, dp_group: dist.ProcessGroupNCCL
     torch.manual_seed(_seed)
     model = Net().to(rank)
     tp_model = ParallelNet(fc0=model.fc0, fc1=model.fc1, fc2=model.fc2).to(rank)
+    loss_fn = nn.CrossEntropyLoss()
+    train_loader, test_loader = load_cifar100()
+    total_steps = len(train_loader) * _test_epochs
     check_params_equal(model, tp_model, tp_group, "Initial weights are equal!")
 
     # Create optimzier and test data
     optim_tp = create_lamb_optimizer(tp_model, _lr, weight_decay=_decay)
     optim = create_lamb_optimizer(model, _lr, weight_decay=_decay)
-    x = torch.rand(_batch_size, _dim, device=rank)
 
     # Test optimizer states
-    for step in range(_test_iter):
-        out = model(x)
-        out_tp = tp_model(x)
+    p_bar = tqdm.tqdm(total=total_steps)
 
-        out.sum().backward()
-        out_tp.sum().backward()
+    for epoch in _test_epochs:
+        for step, (x, y) in enumerate(train_loader):
+            out = model(x)
+            out_tp = tp_model(x)
 
-        optim.step()
-        optim.zero_grad()
-        optim_tp.step()
-        optim_tp.zero_grad()
+            loss = loss_fn(out, y)
+            loss_tp = loss_fn(out_tp, y)
+            loss.backward()
+            loss_tp.backward()
 
-        # check param update
-        check_params_equal(model, tp_model, tp_group, message=f"Step {step} passed!")
+            optim.step()
+            optim.zero_grad()
+            optim_tp.step()
+            optim_tp.zero_grad()
+
+            # check param update
+            check_params_equal(model, tp_model, tp_group, message=f"Step {step} passed!")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test LAMB + TP")
     parser.add_argument(
-        "--test_err",
+        "--assert_err",
         default=True,
         type=eval,
-        help="Wheter to assert absolute & relative error. If not, will compare acc on cifar10.",
+        help="Wheter to assert absolute & relative error, or ",
     )
     parser.add_argument
     args = parser.parse_args()
